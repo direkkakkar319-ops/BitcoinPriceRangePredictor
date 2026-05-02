@@ -1,17 +1,20 @@
 import requests
 import pandas as pd
 
-_BINANCE = "https://api.binance.com/api/v3/klines"
-_BYBIT   = "https://api.bybit.com/v5/market/kline"
+_BINANCE       = "https://api.binance.com/api/v3/klines"
+_CRYPTOCOMPARE = "https://min-api.cryptocompare.com/data/v2/histohour"
+
+# HTTP status codes that mean "this region is blocked"
+_GEO_BLOCKED = {451, 403}
 
 
 def fetch_btc(limit=1000, end_time=None):
-    """Try Binance; fall back to Bybit on 451 (US geo-block on Render)."""
+    """Try Binance; fall back to CryptoCompare on geo-block (Render US servers)."""
     try:
         return _binance(limit, end_time)
     except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 451:
-            return _bybit(limit)
+        if e.response is not None and e.response.status_code in _GEO_BLOCKED:
+            return _cryptocompare(limit)
         raise
 
 
@@ -33,25 +36,20 @@ def _binance(limit, end_time=None):
     return df.sort_values("open_time").reset_index(drop=True)
 
 
-def _bybit(limit=1000):
-    # Bybit returns newest-first; max 1000 per call
-    params = {
-        "category": "spot",
-        "symbol":   "BTCUSDT",
-        "interval": "60",
-        "limit":    min(limit, 1000),
-    }
-    r = requests.get(_BYBIT, params=params, timeout=15)
+def _cryptocompare(limit=1000):
+    # Returns limit+1 bars (includes the current open bar); we drop it like Binance
+    params = {"fsym": "BTC", "tsym": "USD", "limit": min(limit, 2000)}
+    r = requests.get(_CRYPTOCOMPARE, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
-    if data.get("retCode", 0) != 0:
-        raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
+    if data.get("Response") != "Success":
+        raise RuntimeError(f"CryptoCompare error: {data.get('Message')}")
 
-    # list columns: [startTime(ms), open, high, low, close, volume, turnover]
-    rows = data["result"]["list"]
-    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
-    df["open_time"] = pd.to_datetime(df["open_time"].astype(int), unit="ms", utc=True)
+    rows = data["Data"]["Data"]
+    df = pd.DataFrame(rows)
+    df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df["close_time"] = df["open_time"] + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)
+    df = df.rename(columns={"volumefrom": "volume"})
     for c in ("open", "high", "low", "close", "volume"):
         df[c] = df[c].astype(float)
 
